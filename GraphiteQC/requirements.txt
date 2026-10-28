@@ -1,0 +1,8 @@
+numpy
+pandas
+scipy
+scikit-image
+opencv-python-headless
+matplotlib
+pillow
+gradio>=4.44,<6
