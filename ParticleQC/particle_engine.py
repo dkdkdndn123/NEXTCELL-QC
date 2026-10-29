@@ -484,7 +484,10 @@ def wilson(k, n, z=1.96):
     den = 1 + z * z / n
     c = (p + z * z / (2 * n)) / den
     h = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / den
-    return 100 * max(0.0, c - h), 100 * min(1.0, c + h)
+    # 0개·전부일 때는 구간 끝을 정확히 0%·100%로 둔다 (부동소수점 오차로 비율보다 살짝 커지거나 작아지면 그래프가 멈춤)
+    lo = 0.0 if k <= 0 else max(0.0, c - h)
+    hi = 1.0 if k >= n else min(1.0, c + h)
+    return 100 * lo, 100 * hi
 
 
 def homogeneity(ks, ns):

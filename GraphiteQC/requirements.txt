@@ -2,6 +2,7 @@ numpy
 pandas
 scipy
 scikit-image
+scikit-learn
 opencv-python-headless
 matplotlib
 pillow

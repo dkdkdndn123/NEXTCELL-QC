@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 import socket
 import gradio as gr
 
-VERSION = "v1.0.2 (2026-10-29)"
+VERSION = "v1.0.3 (2026-10-29)"
 TEAM = "NEXT CELL"
 MEMBERS = "윤성빈(팀장) · 김태욱 · 공진우 · 허동현"
 SCHOOL = "순천제일대학교 에너지소재화공과"
@@ -210,7 +210,8 @@ def summarize_entries(entries, mag, d50_min, d50_max, span_max, circ_min, defect
     xs = np.arange(1, n_img + 1)
     rates = np.array([100 * k / n if n else np.nan for k, n in zip(ks, ns)])
     cis = np.array([ge.wilson(k, n) for k, n in zip(ks, ns)])
-    ax[2].errorbar(xs, rates, yerr=[rates - cis[:, 0], cis[:, 1] - rates], fmt="o", color="#C62828", ecolor="#C62828", capsize=3, alpha=0.8)
+    ax[2].errorbar(xs, rates, yerr=np.clip(np.vstack([rates - cis[:, 0], cis[:, 1] - rates]), 0, None),   # 음수 막대 방지
+                   fmt="o", color="#C62828", ecolor="#C62828", capsize=3, alpha=0.8)
     ax[2].axhline(s["결함 입자 (%, 판상·균열·조각)"], color="k", lw=1.5, label=f"pooled {s['결함 입자 (%, 판상·균열·조각)']:g}%")
     if n_single:
         ax[2].axhspan(lo, hi, color="k", alpha=0.08)
