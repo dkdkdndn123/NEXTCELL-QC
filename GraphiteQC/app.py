@@ -10,8 +10,9 @@
   - 응집·접촉, 판정 불가(겹침·흐림), 입자 아님(테이프)은 형상 통계에서 제외
   - 사진 한 장은 판정 입자가 수십 개뿐이라 결함률이 ±5%p 안팎 흔들린다(셈 오차). 그래서 여러 장을 합산해 판정하고,
     합산 결함률의 95% 신뢰구간과 사진 간 동질성(셈 오차로 설명되는지)을 함께 표시한다
+  - 'AI 다시 학습': 새 사진에서 입자 잘라 내기 → 사람이 폴더로 분류 → 학습 시작 → 새 모델로 바꾸기 (처음 모델로 되돌리기 가능)
 """
-import os, sys, tempfile, threading, webbrowser
+import os, sys, json, shutil, datetime, subprocess, tempfile, threading, webbrowser
 import numpy as np
 import pandas as pd
 import cv2
@@ -21,7 +22,7 @@ import matplotlib.pyplot as plt
 import socket
 import gradio as gr
 
-VERSION = "v1.0.3 (2026-10-29)"
+VERSION = "v1.1.0 (2026-10-30)"
 TEAM = "NEXT CELL"
 MEMBERS = "윤성빈(팀장) · 김태욱 · 공진우 · 허동현"
 SCHOOL = "순천제일대학교 에너지소재화공과"
@@ -41,20 +42,51 @@ ABOUT = f"""### 만든 사람
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import graphite_engine as ge
+import graphite_tools as gt
 import color_legend as cl
 
 MODEL_PATH = os.path.join(HERE, "particle_model.npz")
+REPORT_PATH = os.path.join(HERE, "particle_model_report.json")
+ORIG_MODEL = os.path.join(HERE, "particle_model_original.npz")             # 처음 모델 (새 모델로 처음 바꿀 때 한 번 보관)
+ORIG_REPORT = os.path.join(HERE, "particle_model_original_report.json")
+BACKUP_DIR = os.path.join(HERE, "model_backup")                            # 바꿀 때마다 그 전 모델을 날짜별로 보관
+DEFAULT_LAB = os.path.join(os.path.expanduser("~"), "Documents", "GraphiteQC", "retrain")
 PORT = 7860
 
-# ---------------------------------------------------------------- AI 모델 (프로그램에 포함)
+
+# ---------------------------------------------------------------- AI 모델 (프로그램에 포함 · 다시 학습하면 바꿀 수 있음)
+def model_name(report_path=REPORT_PATH):
+    """지금 쓰는 모델 이름: 기본 모델(팀 라벨) / 새로 학습한 모델(날짜 · 입자 수)"""
+    try:
+        with open(report_path, encoding="utf-8") as fh:
+            rep = json.load(fh)
+    except Exception:
+        return "AI 모델"
+    n = rep.get("n")
+    n_txt = f" · 입자 {n:,}개" if isinstance(n, int) else ""
+    if rep.get("trained_at"):
+        return f"새로 학습한 모델 ({rep['trained_at']}{n_txt})"
+    return f"기본 모델 (팀이 분류한 입자 {n:,}개)" if isinstance(n, int) else "기본 모델"
+
+
 classify = None
-try:
-    from particle_model import ParticleModel
-    _model = ParticleModel(MODEL_PATH)
-    classify = _model.predict
-    model_msg = "AI 판정 모델 준비 완료"
-except Exception as e:
-    model_msg = f"AI 모델을 불러오지 못했습니다 ({e}). 규칙 기반으로 판정합니다."
+MODEL_NAME = ""
+
+
+def load_model():
+    """particle_model.npz 를 (다시) 불러와 검사에 쓴다. 새 모델로 바꾸거나 되돌린 뒤에도 부른다"""
+    global classify, MODEL_NAME
+    try:
+        from particle_model import ParticleModel
+        classify = ParticleModel(MODEL_PATH).predict
+        MODEL_NAME = model_name()
+        return f"AI 판정 모델 준비 완료 · {MODEL_NAME}"
+    except Exception as e:
+        classify, MODEL_NAME = None, ""
+        return f"AI 모델을 불러오지 못했습니다 ({e}). 규칙 기반으로 판정합니다."
+
+
+model_msg = load_model()
 print(model_msg)
 
 LEGEND = ("**그림 색** (결과 그림 아래 회색 띠에도 같은 설명이 있습니다): "
@@ -154,7 +186,7 @@ def summarize_entries(entries, mag, d50_min, d50_max, span_max, circ_min, defect
     all_df.attrs["n_not_particle"] = sum(d.attrs.get("n_not_particle", 0) for d in dfs)
     s, checks, ok = ge.summarize(all_df, (d50_min, d50_max), span_max, defect_max, circ_min)
     if use_ai:
-        method = "AI (구형 / 비구형 / 결함 / 판정불가)"
+        method = f"AI (구형 / 비구형 / 결함 / 판정불가) · {MODEL_NAME}"
     elif mag == 2000:
         method = "규칙 기반 (AI 모델 불러오기 실패)"
     else:
@@ -315,6 +347,221 @@ def edit_recalc(st, d50_min, d50_max, span_max, circ_min, defect_max, exclude_ba
     return summarize_entries(st["entries"], st["mag"], d50_min, d50_max, span_max, circ_min, defect_max, exclude_bad, use_circ)
 
 
+# ---------------------------------------------------------------- AI 다시 학습
+# 새 사진 → ① 입자 잘라 내기 → ② 사람이 폴더로 분류 → ③ 학습 시작 → ④ 새 모델로 바꾸기 (처음 모델로 되돌리기 가능)
+# 계산은 graphite_tools (명령 ingest_new_photos.py · train_particle_model.py 와 같은 함수)
+def _lab(lab):
+    return (lab or "").strip().strip('"') or DEFAULT_LAB
+
+
+def _safe_name(s):
+    s = (s or "").strip() or "new"
+    return "".join("_" if ch in '\\/:*?"<>|' else ch for ch in s)
+
+
+def _tick(progress, frac, desc):
+    try:
+        progress(frac, desc=desc)
+    except Exception:
+        pass
+
+
+def _pct(v):
+    return "–" if v is None else f"{100 * v:.0f}%"
+
+
+def _pct1(v):
+    return "–" if v is None else f"{v:.1f}%"
+
+
+def tr_status_text(lab, note=""):
+    lab = _lab(lab)
+    head = f"{note}  \n" if note else ""
+    using = f"지금 검사에 쓰는 모델: **{MODEL_NAME or '없음 (규칙 기반)'}**"
+    if not os.path.isdir(lab):
+        return head + f"학습 폴더 `{lab}` 가 아직 없습니다. **폴더 열기 / 만들기**를 누르세요.  \n" + using
+    s = gt.label_status(lab)
+    total = s["round"] + s["nonspherical"] + s["defect"] + s["exclude"]
+    msg = (f"학습 폴더 `{lab}` · 사진 {s['photos']}장 · 분류 전 입자 {s['unsorted']}개  \n"
+           f"분류한 입자 {total:,}개: round {s['round']} · nonspherical {s['nonspherical']} · defect {s['defect']} · exclude {s['exclude']}")
+    if total and (s["defect"] < gt.REC_DEFECT or total < gt.REC_TOTAL):
+        msg += (f"  \nℹ️ 권장: defect {gt.REC_DEFECT}개 이상, 전체 {gt.REC_TOTAL:,}개 이상 "
+                "(적으면 새 모델이 지금 모델보다 나빠질 수 있습니다)")
+    msg += "  \n" + using
+    if s["model"]:
+        msg += " · 학습 폴더에 새로 학습한 모델이 있습니다 (④에서 바꿀 수 있음)"
+    return head + msg
+
+
+def tr_open(lab):
+    lab = _lab(lab)
+    try:
+        gt.ensure_label_dir(lab)
+    except Exception as e:
+        return lab, f"❌ 폴더를 만들지 못했습니다: {e}"
+    return lab, tr_status_text(lab)
+
+
+def _read_rgb_any(p):
+    im = cv2.imdecode(np.fromfile(p, dtype=np.uint8), cv2.IMREAD_COLOR)
+    return cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+
+
+def tr_ingest(lab, files, sample, progress=gr.Progress()):
+    lab = _lab(lab)
+    paths = [f if isinstance(f, str) else f.name for f in (files or [])]
+    if not paths:
+        return "새 ×2,000 사진을 올려 주세요.", None, tr_status_text(lab)
+    sample = _safe_name(sample)
+    logs = []
+
+    def log(s):
+        logs.append(s)
+        _tick(progress, min(len(logs) / max(len(paths), 1), 1.0), s)
+
+    try:
+        gt.ensure_label_dir(lab)
+        keep = os.path.join(lab, "photos", sample)              # 학습에 쓴 사진을 학습 폴더에 함께 보관
+        os.makedirs(keep, exist_ok=True)
+        copies = []
+        for p in paths:
+            dst = os.path.join(keep, os.path.basename(p))
+            if os.path.abspath(p) != os.path.abspath(dst):
+                shutil.copy2(p, dst)
+            copies.append(dst)
+        _, sheets = gt.ingest(lab, copies, sample=sample, log=log)
+    except Exception as e:
+        return "  \n".join(logs) + f"\n\n❌ 입자를 잘라 내지 못했습니다: {e}", None, tr_status_text(lab)
+    gallery = [(_read_rgb_any(p), os.path.basename(p)) for p in sheets]
+    msg = ("  \n".join(logs) + "\n\n이제 **② 사람이 분류하기**: 학습 폴더의 `crops` 그림을 보면서 네 폴더로 옮겨 주세요. "
+           "시트의 번호는 crops.csv 순서이고, 그림 이름은 `시료_사진_p번호.png` 입니다.")
+    return msg, gallery, tr_status_text(lab)
+
+
+def tr_open_folder(lab):
+    lab = _lab(lab)
+    try:
+        gt.ensure_label_dir(lab)
+        if os.name == "nt":
+            os.startfile(lab)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", lab])
+        else:
+            subprocess.Popen(["xdg-open", lab])
+        note = "탐색기에서 학습 폴더를 열었습니다. `crops` 의 그림을 round / nonspherical / defect / exclude 폴더로 옮겨 주세요."
+    except Exception as e:
+        note = f"폴더를 열지 못했습니다 ({e}). 탐색기에서 직접 열어 주세요: `{lab}`"
+    return tr_status_text(lab, note)
+
+
+def tr_report(rep, out):
+    pc = rep["per_class"]
+    new = rep.get("new_model_cv") or {}
+    cur = rep.get("current_model")
+    c = lambda k: _pct(cur[k]) if cur else "–"
+    lines = ["### 학습 결과",
+             f"라벨 {rep['n']:,}개 (round {pc['round']} · nonspherical {pc['nonspherical']} · defect {pc['defect']} · exclude {pc['exclude']}) · "
+             f"사진 {rep['n_images']}장 · 사진 단위 {rep.get('cv_folds', 5)}겹 교차검증",
+             "",
+             "| 같은 라벨로 비교 | 지금 쓰는 모델 | 새 모델 |",
+             "|---|---|---|",
+             f"| 결함 입자를 찾아낸 비율 (재현율) | {c('recall')} | {_pct(new.get('recall'))} |",
+             f"| 결함이라고 한 것 중 맞은 비율 (정밀도) | {c('precision')} | {_pct(new.get('precision'))} |",
+             f"| 정상·결함 라벨이 판정 불가로 빠진 비율 | {c('labeled_lost')} | {_pct(new.get('labeled_lost'))} |"]
+    for s, v in (new.get("per_sample") or {}).items():
+        cs = ((cur or {}).get("per_sample") or {}).get(s) or {}
+        lines.append(f"| 시료 {s or '(이름 없음)'} 결함 비율 (사람 라벨 {_pct1(v.get('label'))}) | {_pct1(cs.get('model'))} | {_pct1(v.get('model'))} |")
+    lines.append("")
+    if cur:
+        up_r, up_p = new.get("recall", 0) >= cur["recall"], new.get("precision", 0) >= cur["precision"]
+        if up_r and up_p:
+            lines.append("➡️ 이 라벨에서는 **새 모델이 결함을 더 잘 찾습니다.**")
+        elif not up_r and not up_p:
+            lines.append("➡️ 이 라벨에서는 **지금 모델이 더 낫습니다.** 라벨을 더 모은 뒤 다시 학습하는 것을 권장합니다.")
+        else:
+            lines.append("➡️ 두 모델의 장단점이 갈립니다. 시료별 결함 비율이 사람 라벨에 더 가까운 쪽을 고르세요.")
+        lines.append("<small>지금 모델 칸은 지금 모델이 이 라벨을 그대로 판정한 값이고, 새 모델 칸은 학습에 쓰지 않은 사진으로 판정한 값(교차검증)입니다. "
+                     "지금 모델이 이미 배운 사진이 섞여 있으면 지금 모델 쪽이 좋게 나옵니다.</small>")
+    total = sum(pc.values())
+    if pc["defect"] < gt.REC_DEFECT or total < gt.REC_TOTAL:
+        lines.append(f"\n⚠️ 라벨이 권장(defect {gt.REC_DEFECT}개 · 전체 {gt.REC_TOTAL:,}개)보다 적어, 새 모델이 지금 모델보다 나빠질 수 있습니다.")
+    lines.append(f"\n새 모델은 학습 폴더에 `{os.path.basename(out)}` 로 저장했고 **아직 검사에는 쓰지 않습니다.** "
+                 "검사에 쓰려면 **④ 새 모델로 바꾸기**를 누르세요.")
+    return "\n".join(lines)
+
+
+def tr_train(lab, progress=gr.Progress()):
+    lab = _lab(lab)
+    if not os.path.exists(os.path.join(lab, "crops.csv")):
+        return "먼저 **① 입자 잘라 내기**를 하세요 (학습 폴더에 crops.csv 가 없습니다).", tr_status_text(lab)
+    out = os.path.join(lab, "particle_model.npz")
+    logs = []
+    try:
+        rep = gt.train(lab, out, cache=os.path.join(lab, "feat_cache.npz"),
+                       compare=MODEL_PATH if os.path.exists(MODEL_PATH) else None,
+                       log=logs.append, progress=lambda f, d: _tick(progress, f, d))
+    except ImportError as e:
+        return (f"❌ 학습에 필요한 프로그램이 설치되지 않았습니다 ({e}). "
+                "`1_처음_설치.bat` 을 한 번 더 실행한 뒤 다시 누르세요."), tr_status_text(lab)
+    except Exception as e:
+        return "  \n".join(logs[-4:]) + f"\n\n❌ 학습하지 못했습니다: {e}", tr_status_text(lab)
+    return tr_report(rep, out), tr_status_text(lab)
+
+
+def _backup_current():
+    """지금 모델을 보관: 처음 한 번은 particle_model_original.npz, 매번 model_backup/ 에 날짜별로"""
+    if not os.path.exists(MODEL_PATH):
+        return
+    if not os.path.exists(ORIG_MODEL):
+        shutil.copy2(MODEL_PATH, ORIG_MODEL)
+        if os.path.exists(REPORT_PATH):
+            shutil.copy2(REPORT_PATH, ORIG_REPORT)
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    shutil.copy2(MODEL_PATH, os.path.join(BACKUP_DIR, f"particle_model_{ts}.npz"))
+    if os.path.exists(REPORT_PATH):
+        shutil.copy2(REPORT_PATH, os.path.join(BACKUP_DIR, f"particle_model_{ts}_report.json"))
+
+
+def tr_apply(lab):
+    lab = _lab(lab)
+    cand = os.path.join(lab, "particle_model.npz")
+    cand_rep = os.path.join(lab, "particle_model_report.json")
+    if not os.path.exists(cand):
+        return "학습 폴더에 새 모델이 없습니다. 먼저 **③ 학습 시작**을 누르세요.", tr_status_text(lab)
+    try:
+        from particle_model import ParticleModel
+        ParticleModel(cand)                                    # 열리는 모델인지 먼저 확인
+        _backup_current()
+        shutil.copy2(cand, MODEL_PATH)
+        if os.path.exists(cand_rep):
+            shutil.copy2(cand_rep, REPORT_PATH)
+    except Exception as e:
+        return f"❌ 새 모델로 바꾸지 못했습니다: {e}", tr_status_text(lab)
+    msg = load_model()
+    return (f"✅ 새 모델로 바꿨습니다. 지금부터 검사에 **{MODEL_NAME}** 을 씁니다.  \n"
+            "처음 모델은 프로그램 폴더에 `particle_model_original.npz` 로 보관했고, **처음 모델로 되돌리기**로 언제든 돌아갈 수 있습니다."
+            if classify is not None else f"❌ {msg}"), tr_status_text(lab)
+
+
+def tr_restore(lab):
+    lab = _lab(lab)
+    if not os.path.exists(ORIG_MODEL):
+        return "처음 모델(기본 모델)을 그대로 쓰고 있습니다. 되돌릴 것이 없습니다.", tr_status_text(lab)
+    try:
+        import filecmp
+        if os.path.exists(MODEL_PATH) and filecmp.cmp(ORIG_MODEL, MODEL_PATH, shallow=False):
+            return "이미 처음 모델을 쓰고 있습니다.", tr_status_text(lab)
+        _backup_current()
+        shutil.copy2(ORIG_MODEL, MODEL_PATH)
+        if os.path.exists(ORIG_REPORT):
+            shutil.copy2(ORIG_REPORT, REPORT_PATH)
+    except Exception as e:
+        return f"❌ 되돌리지 못했습니다: {e}", tr_status_text(lab)
+    msg = load_model()
+    return (f"✅ 처음 모델로 되돌렸습니다. 지금부터 검사에 **{MODEL_NAME}** 을 씁니다." if classify is not None else f"❌ {msg}"), tr_status_text(lab)
+
+
 # ---------------------------------------------------------------- 화면
 
 with gr.Blocks(title="흑연 입자 AI 품질검사 · NEXT CELL") as demo:
@@ -356,6 +603,44 @@ with gr.Blocks(title="흑연 입자 AI 품질검사 · NEXT CELL") as demo:
     edit_img.select(edit_click, [st, edit_pick, edit_mode], [edit_img, st, edit_msg])
     reset.click(edit_reset, [st, edit_pick], [edit_img, st, edit_msg])
     recalc.click(edit_recalc, [st] + criteria, [gallery, verdict, table, per_tbl, plot, csv])
+    with gr.Accordion("AI 다시 학습 — 새 사진으로 학습시키기", open=False):
+        gr.Markdown("검사만 해서는 AI가 배우지 않습니다. 같은 조건(×2,000 · 20 kV · SE · 코팅)으로 찍은 새 사진에서 입자를 잘라 내고, "
+                    "사람이 폴더로 분류해 넣은 뒤 학습시킵니다. 새 모델은 결과를 확인하고 **새 모델로 바꾸기**를 눌러야 검사에 쓰이며, "
+                    "**처음 모델로 되돌리기**로 언제든 돌아갈 수 있습니다.  \n"
+                    "지금 모델보다 좋아지게 하려면 예전에 분류한 라벨 폴더(round · nonspherical · defect · exclude 폴더와 crops.csv)를 학습 폴더로 정하고 "
+                    "새 사진을 이어 붙이세요. 새 라벨만으로 학습하면 그 사진들만 배운 모델이 됩니다.")
+        with gr.Row():
+            tr_lab = gr.Textbox(value=DEFAULT_LAB, label="학습 폴더 (없으면 만들어집니다)", scale=4)
+            tr_open_btn = gr.Button("폴더 열기 / 만들기", scale=1)
+        tr_status = gr.Markdown(tr_status_text(DEFAULT_LAB))
+        gr.Markdown("**① 입자 잘라 내기** — 새 ×2,000 사진을 올리면 단독 입자를 하나씩 잘라 `crops` 폴더에 넣고, 번호가 붙은 시트를 만듭니다.")
+        with gr.Row():
+            tr_files = gr.File(label="새 SEM 사진 (×2,000, 여러 장 · 10~20장 권장)", file_count="multiple", file_types=["image"])
+            tr_sample = gr.Textbox(value="new", label="시료 이름 (예: 1030로트 · 학습 결과에 시료별 결함 비율이 나옵니다)")
+        tr_ing_btn = gr.Button("입자 잘라 내기", variant="primary")
+        tr_ing_msg = gr.Markdown("")
+        tr_sheets = gr.Gallery(label="라벨링 시트 (번호 = crops.csv 순서)", columns=2, height=420, object_fit="contain")
+        gr.Markdown("**② 사람이 분류하기** — 학습 폴더의 `crops` 그림을 보고 같은 학습 폴더 안의 네 폴더로 옮깁니다: "
+                    "`round` 둥글고 멀쩡 · `nonspherical` 길쭉·각지지만 표면 멀쩡 · `defect` 판상·균열·박리·깨진 조각 · "
+                    "`exclude` 겹침·흐림·테이프 조각·판단 불가 (exclude 도 꼭 넣어야 '판정 불가'를 배웁니다).")
+        with gr.Row():
+            tr_folder_btn = gr.Button("탐색기로 학습 폴더 열기")
+            tr_count_btn = gr.Button("분류한 개수 확인")
+        gr.Markdown("**③ 학습** — 입자 2,000개 기준 5~10분 걸립니다. 끝나면 지금 모델과 새 모델을 같은 라벨로 비교해 보여 줍니다.")
+        tr_train_btn = gr.Button("학습 시작", variant="primary")
+        tr_train_msg = gr.Markdown("")
+        gr.Markdown("**④ 검사에 쓰기** — 비교 결과를 보고 정하세요.")
+        with gr.Row():
+            tr_apply_btn = gr.Button("새 모델로 바꾸기", variant="primary")
+            tr_restore_btn = gr.Button("처음 모델로 되돌리기")
+        tr_apply_msg = gr.Markdown("")
+    tr_open_btn.click(tr_open, [tr_lab], [tr_lab, tr_status])
+    tr_ing_btn.click(tr_ingest, [tr_lab, tr_files, tr_sample], [tr_ing_msg, tr_sheets, tr_status])
+    tr_folder_btn.click(tr_open_folder, [tr_lab], [tr_status])
+    tr_count_btn.click(tr_status_text, [tr_lab], [tr_status])
+    tr_train_btn.click(tr_train, [tr_lab], [tr_train_msg, tr_status])
+    tr_apply_btn.click(tr_apply, [tr_lab], [tr_apply_msg, tr_status])
+    tr_restore_btn.click(tr_restore, [tr_lab], [tr_apply_msg, tr_status])
     with gr.Accordion("만든 사람 · 프로그램 정보", open=False):
         gr.Markdown(ABOUT)
 

@@ -21,7 +21,7 @@ from particle_model import ParticleModel
 import gradio as gr
 
 PORT = 7861
-VERSION = "v1.0.3 (2026-10-29)"
+VERSION = "v1.1.0 (2026-10-30)"
 TEAM = "NEXT CELL"
 MEMBERS = "윤성빈(팀장) · 김태욱 · 공진우 · 허동현"
 SCHOOL = "순천제일대학교 에너지소재화공과"
